@@ -1,4 +1,68 @@
+import json
+from datetime import datetime, timezone
+
 from app.db import connect
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _recover_stale_requests(conn):
+    """Requeue requests left 'running' by a crashed worker (at-least-once recovery).
+
+    A 'running' row at startup can only belong to a dead process, since the
+    consumer is a single serial worker. Two cases:
+
+    * the linked orchestration already reached a terminal state -> reconcile
+      the request to it (the work finished, only the status update was lost),
+      so the run is never executed twice;
+    * otherwise -> close the half-finished orchestration as 'aborted' and
+      requeue the request as 'pending' for another attempt.
+    """
+    stale = conn.execute(
+        "SELECT id, orchestration_id FROM orchestration_requests WHERE status='running'"
+    ).fetchall()
+    for row in stale:
+        orch_id = row["orchestration_id"]
+        if orch_id is not None:
+            orch = conn.execute(
+                "SELECT status FROM orchestrations WHERE id=?", (orch_id,)
+            ).fetchone()
+            if orch is not None and orch["status"] in ("ok", "partial", "failed"):
+                recovered_status = "succeeded" if orch["status"] != "failed" else "failed"
+                conn.execute(
+                    """
+                    UPDATE orchestration_requests
+                    SET status=?, finished_at=?, worker_name=NULL
+                    WHERE id=?
+                    """,
+                    (recovered_status, _now(), row["id"]),
+                )
+                continue
+            conn.execute(
+                """
+                UPDATE orchestrations
+                SET status='aborted', finished_at=?, report_json=?
+                WHERE id=? AND status='running'
+                """,
+                (
+                    _now(),
+                    json.dumps(
+                        {"aborted_reason": "worker restarted before orchestration finished"},
+                        ensure_ascii=False,
+                    ),
+                    orch_id,
+                ),
+            )
+        conn.execute(
+            """
+            UPDATE orchestration_requests
+            SET status='pending', worker_name=NULL, started_at=NULL, orchestration_id=NULL
+            WHERE id=?
+            """,
+            (row["id"],),
+        )
 
 
 def init_db():
@@ -40,8 +104,25 @@ def init_db():
             artifact_rows INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS orchestration_requests(
+            id INTEGER PRIMARY KEY,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            note TEXT,
+            status TEXT NOT NULL,
+            dedupe_count INTEGER NOT NULL DEFAULT 0,
+            orchestration_id INTEGER,
+            error TEXT,
+            worker_name TEXT,
+            created_at TEXT NOT NULL,
+            enqueued_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_orch_req_status
+            ON orchestration_requests(status, id);
         """
     )
+    _recover_stale_requests(conn)
     if conn.execute("SELECT COUNT(*) c FROM jobs").fetchone()["c"] == 0:
         jobs = [
             (

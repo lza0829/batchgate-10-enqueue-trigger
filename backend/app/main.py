@@ -6,12 +6,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import APP_NAME
 from app.routers import api
 from app.seed import init_db
+from app.worker import worker
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # init_db also requeues any request left 'running' by a crashed process.
     init_db()
-    yield
+    worker.start()
+    try:
+        yield
+    finally:
+        worker.stop()
 
 
 app = FastAPI(title=APP_NAME, lifespan=lifespan)

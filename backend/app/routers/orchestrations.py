@@ -2,7 +2,6 @@ from fastapi import APIRouter, HTTPException
 
 from app.db import connect
 from app.repositories import orchestrations as orch_repo
-from app.services.orchestrate_service import run_orchestration
 
 router = APIRouter(tags=["orchestrations"])
 
@@ -28,6 +27,17 @@ def get_orchestration(orch_id: int):
         conn.close()
 
 
-@router.post("/orchestrations")
+@router.post("/orchestrations", status_code=410)
 def create_orchestration():
-    return run_orchestration()
+    """Synchronous 'run whole graph' entry is gone.
+
+    All orchestrations must go through the idempotent request queue so the
+    queue books and orchestration records stay reconcilable.
+    """
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "synchronous orchestration endpoint removed; "
+            "POST /api/requests with an idempotency_key instead"
+        ),
+    )
